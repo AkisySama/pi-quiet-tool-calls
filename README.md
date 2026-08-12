@@ -4,6 +4,8 @@ A [pi](https://github.com/earendil-works/pi-mono) extension that quiets tool cal
 
 While a command is running, the placeholder animates with a spinner and an elapsed-time counter, so long-running commands never look frozen.
 
+![screenshot](screenshot.png)
+
 > Display-only: tool execution, LLM context, and session files are completely unchanged.
 
 ## Features
