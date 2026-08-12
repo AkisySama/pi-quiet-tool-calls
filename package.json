@@ -1,0 +1,24 @@
+{
+  "name": "pi-quiet-tool-calls",
+  "version": "1.0.0",
+  "description": "Quiet tool display for pi: collapse bash/read/write/edit/grep/find/ls calls into a subtle cyan placeholder with a live spinner — no more giant green/red boxes",
+  "keywords": [
+    "pi-package",
+    "pi",
+    "extension",
+    "tui",
+    "quiet",
+    "minimal",
+    "tool-call"
+  ],
+  "license": "MIT",
+  "pi": {
+    "extensions": [
+      "./extensions/quiet-tools.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*"
+  }
+}
