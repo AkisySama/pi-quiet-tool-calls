@@ -11,6 +11,15 @@
     "minimal",
     "tool-call"
   ],
+  "author": "AkisySama",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AkisySama/pi-quiet-tool-calls.git"
+  },
+  "homepage": "https://github.com/AkisySama/pi-quiet-tool-calls#readme",
+  "bugs": {
+    "url": "https://github.com/AkisySama/pi-quiet-tool-calls/issues"
+  },
   "license": "MIT",
   "pi": {
     "extensions": [

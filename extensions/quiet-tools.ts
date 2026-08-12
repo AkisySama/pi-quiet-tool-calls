@@ -20,7 +20,7 @@
  *   - 会话文件（~/.pi/sessions/*.jsonl）仍会保存完整命令与输出。
  *
  * 用法：
- *   pi install git:github.com/<user>/pi-quiet-tool-calls@v1.0.0
+ *   pi install git:github.com/AkisySama/pi-quiet-tool-calls@v1.0.0
  *   或放入 ~/.pi/agent/extensions/ 后 /reload
  */
 

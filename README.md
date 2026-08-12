@@ -20,18 +20,18 @@ While a command is running, the placeholder animates with a spinner and an elaps
 From GitHub (recommended, pinned to a release tag):
 
 ```bash
-pi install git:github.com/<your-name>/pi-quiet-tool-calls@v1.0.0
+pi install git:github.com/AkisySama/pi-quiet-tool-calls@v1.0.0
 ```
 
 Try it without installing:
 
 ```bash
-pi -e git:github.com/<your-name>/pi-quiet-tool-calls
+pi -e git:github.com/AkisySama/pi-quiet-tool-calls
 ```
 
 Manual install: copy `extensions/quiet-tools.ts` into `~/.pi/agent/extensions/` (global) or `.pi/extensions/` (project-local), then `/reload`.
 
-Remove: `pi remove git:github.com/<your-name>/pi-quiet-tool-calls`
+Remove: `pi remove git:github.com/AkisySama/pi-quiet-tool-calls`
 
 ## Usage
 
