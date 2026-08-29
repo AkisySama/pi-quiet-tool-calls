@@ -11,6 +11,8 @@ A [pi](https://github.com/earendil-works/pi-mono) extension that quiets tool cal
 💻 Bash  · npm run build                        ✗ exit 2 · 0.4s
 ```
 
+> 以上为终端实际效果的文字示意。
+
 Each step is a **state**: icon + tool name + one-line summary while idle, spinner + elapsed seconds while running, `✓` with result stats when done, `✗` with exit code / timeout when it fails. Long-running commands never look frozen.
 
 > Display-only: tool execution, LLM context, and session files are completely unchanged.
