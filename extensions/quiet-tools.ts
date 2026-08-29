@@ -1,62 +1,160 @@
 /**
- * pi-quiet-tool-calls — 隐藏工具调用细节（pi 扩展）
+ * pi-quiet-tool-calls v2 — 状态化工具折叠（pi 扩展）
  *
  * 默认状态（quiet）：
- *   - 所有内置工具调用（bash/read/write/edit/grep/find/ls）折叠成一行青色
- *     "⚙ tool call" 占位符；命令、参数、输出全部不显示。
- *   - 运行中显示旋转动画 + 已耗时秒数，长命令不会让用户以为卡死。
- *   - 不再有 pi 默认的大号绿/红框子。
+ *   每个工具调用折叠成一行，图标 + 工具名 + 一句话摘要，一眼看出 agent 正在做什么：
+ *     📖 Read  · Sources/App.swift
+ *     💻 Bash  · npm test
+ *     ✏️ Edit  · src/index.ts · 3 edits
+ *     🔍 Grep  · applyIconChoice|AppIcon... in Sources
+ *   - 执行中：行尾旋转动画 + 已耗时        💻 Bash · npm test ⠹ 3s
+ *   - 完成：  ✓ 结果统计 + 耗时            🔍 Grep · "x" in src ✓ 42 matches · 0.4s
+ *   - 出错：  ✗ 错误信息                   💻 Bash · npm run build ✗ exit 2 · 0.4s
+ *   输出内容、绿色/红色大框全部隐藏。
  *
  * 展开查看：
- *   - 按 Ctrl+O（全局展开工具输出，默认键位 app.tools.expand）时，占位符会临时还原为真实的命令+输出，
- *     使用 pi 内置渲染器，但仍无彩色外框。
+ *   Ctrl+O（全局展开工具输出，app.tools.expand）：占位符临时还原为 pi 内置的真实
+ *   命令 + 输出渲染（委托内置渲染器，无彩色外框）。
  *
  * 切换：
- *   - /toggletools  在 quiet（隐藏）和 full（完整显示）之间切换。
- *   - pi --show-tools  启动时直接进入完整显示模式。
+ *   /toggletools            在 quiet / full 之间切换
+ *   /toggletools quiet|full 直接指定
+ *   pi --show-tools         启动即完整显示
+ *
+ *
+ * 配置文件 ~/.pi/quiet-tools.json（可选，自动创建，删除即恢复默认）：
+ *   {
+ *     "hidden": true,                 // 默认是否隐藏细节
+ *     "icons": true,                  // 是否显示 emoji 图标（false 用纯文本标签）
+ *     "maxSummary": 60,               // 摘要最大字符数
+ *     "style": {                      // 覆盖图标/标签
+ *       "read":  { "icon": "📄", "label": "Read" },
+ *       "bash":  { "icon": "⚡", "label": "Shell" }
+ *     }
+ *   }
  *
  * 说明：
- *   - 只影响 TUI 显示；工具实际执行行为和会话内容完全不变。
- *   - 会话文件（~/.pi/sessions/*.jsonl）仍会保存完整命令与输出。
- *
- * 用法：
- *   pi install git:github.com/AkisySama/pi-quiet-tool-calls@v1.0.0
- *   或放入 ~/.pi/agent/extensions/ 后 /reload
+ *   - 只影响 TUI 显示；工具执行、LLM 上下文与会话文件完全不变。
+ *   - 颜色全部取自当前主题变量（accent/success/error/dim），自动适配深浅主题。
  */
 
 import type {
   ExtensionAPI,
   Theme,
   ToolDefinition,
-  ToolRenderContext,
 } from "@earendil-works/pi-coding-agent";
 import {
+  CONFIG_DIR_NAME,
   createBashToolDefinition,
   createEditToolDefinition,
   createFindToolDefinition,
   createGrepToolDefinition,
   createLsToolDefinition,
+  createPowerShellToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
+import { isAbsolute, relative, dirname, join } from "node:path";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { homedir } from "node:os";
 
 // ---------------------------------------------------------------------------
-// 状态
+// 配置
 // ---------------------------------------------------------------------------
 
-/** true = quiet 模式（隐藏细节），false = 完整显示 */
+/** true = quiet（隐藏细节，默认），false = 完整显示 */
 let hidden = true;
+/** 是否显示 emoji 图标 */
+let useIcons = true;
+/** 摘要最大字符数 */
+let maxSummary = 60;
 
-const TOOL_NAMES = ["read", "bash", "edit", "write", "grep", "find", "ls"] as const;
-type BuiltinName = (typeof TOOL_NAMES)[number];
+interface ToolStyle {
+  icon: string;
+  label: string;
+}
+
+const DEFAULT_STYLES: Record<string, ToolStyle> = {
+  read: { icon: "📖", label: "Read" },
+  bash: { icon: "💻", label: "Bash" },
+  powershell: { icon: "🖥️", label: "PowerShell" },
+  edit: { icon: "✏️", label: "Edit" },
+  write: { icon: "📝", label: "Write" },
+  grep: { icon: "🔍", label: "Grep" },
+  find: { icon: "📂", label: "Find" },
+  ls: { icon: "🗂️", label: "Ls" },
+};
+
+/** 未配置样式的工具（防御性回退，正常不会走到） */
+const FALLBACK_STYLE: ToolStyle = { icon: "⚙", label: "Tool call" };
+
+let styles: Record<string, ToolStyle> = { ...DEFAULT_STYLES };
+
+interface Config {
+  hidden?: boolean;
+  icons?: boolean;
+  maxSummary?: number;
+  style?: Record<string, { icon?: string; label?: string }>;
+}
+
+const CONFIG_PATH = join(homedir(), CONFIG_DIR_NAME, "quiet-tools.json");
+
+function loadConfig(): void {
+  try {
+    const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Config;
+    if (typeof cfg.hidden === "boolean") hidden = cfg.hidden;
+    if (typeof cfg.icons === "boolean") useIcons = cfg.icons;
+    if (typeof cfg.maxSummary === "number" && cfg.maxSummary > 0)
+      maxSummary = Math.floor(cfg.maxSummary);
+    for (const [name, s] of Object.entries(cfg.style ?? {})) {
+      const base = DEFAULT_STYLES[name] ?? FALLBACK_STYLE;
+      styles[name] = { ...base, ...s };
+    }
+  } catch {
+    // 无配置文件或解析失败：使用默认值
+  }
+}
+
+function saveConfig(): void {
+  try {
+    mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    writeFileSync(
+      CONFIG_PATH,
+      JSON.stringify(
+        {
+          hidden,
+          icons: useIcons,
+          maxSummary,
+          style: Object.fromEntries(
+            Object.entries(styles).map(([k, v]) => [k, { ...v }]),
+          ),
+        },
+        null,
+        2,
+      ),
+    );
+  } catch {
+    // 写入失败不影响功能
+  }
+}
+
+function getStyle(toolName: string): ToolStyle {
+  return styles[toolName] ?? FALLBACK_STYLE;
+}
 
 // ---------------------------------------------------------------------------
 // 内置工具定义（按 cwd 缓存）
 // ---------------------------------------------------------------------------
 
+const TOOL_NAMES = ["read", "bash", "powershell", "edit", "write", "grep", "find", "ls"] as const;
+type BuiltinName = (typeof TOOL_NAMES)[number];
 type AnyToolDef = ToolDefinition<any, any, any>;
+
+/** 从 ToolDefinition 推导渲染上下文类型（内部类型未从包根导出） */
+type RenderContext = Parameters<NonNullable<AnyToolDef["renderCall"]>>[2];
+type RenderResultOptions = Parameters<NonNullable<AnyToolDef["renderResult"]>>[1];
 
 const definitionCache = new Map<string, Record<BuiltinName, AnyToolDef>>();
 
@@ -66,6 +164,7 @@ function getDefinitions(cwd: string): Record<BuiltinName, AnyToolDef> {
     defs = {
       read: createReadToolDefinition(cwd),
       bash: createBashToolDefinition(cwd),
+      powershell: createPowerShellToolDefinition(cwd),
       edit: createEditToolDefinition(cwd),
       write: createWriteToolDefinition(cwd),
       grep: createGrepToolDefinition(cwd),
@@ -78,8 +177,8 @@ function getDefinitions(cwd: string): Record<BuiltinName, AnyToolDef> {
 }
 
 // ---------------------------------------------------------------------------
-// 委托内置渲染器时需要的 per-row 缓存
-// （内置渲染器依赖 lastComponent 复用 + 共享 state，需模拟 ToolExecutionComponent 的行为）
+// 委托内置渲染器（展开/完整模式）：per-row 缓存
+// 内置渲染器依赖 lastComponent 复用 + 共享 state，模拟 ToolExecutionComponent 行为
 // ---------------------------------------------------------------------------
 
 interface RowCache {
@@ -103,7 +202,7 @@ function delegateCall(
   builtin: AnyToolDef,
   args: unknown,
   theme: Theme,
-  context: ToolRenderContext,
+  context: RenderContext,
 ): Component {
   const cache = getRowCache(context.toolCallId);
   const comp = builtin.renderCall!(args, theme, {
@@ -118,9 +217,9 @@ function delegateCall(
 function delegateResult(
   builtin: AnyToolDef,
   result: { content: unknown[]; details: unknown },
-  options: { expanded: boolean; isPartial: boolean },
+  options: RenderResultOptions,
   theme: Theme,
-  context: ToolRenderContext,
+  context: RenderContext,
 ): Component {
   const cache = getRowCache(context.toolCallId);
   const comp = builtin.renderResult!(result as never, options, theme, {
@@ -133,73 +232,312 @@ function delegateResult(
 }
 
 // ---------------------------------------------------------------------------
-// 占位符 + 运行中动画
+// 摘要（一句话说明这一步在做什么）
 // ---------------------------------------------------------------------------
 
-/** 旋转字符帧（经典 CLI spinner） */
+function truncate(s: string, n = maxSummary): string {
+  const flat = s.replace(/[\r\n\t]+/g, " ").trim();
+  if (flat.length <= n) return flat;
+  return `${flat.slice(0, Math.max(1, n - 1))}…`;
+}
+
+/** 使路径相对于 cwd（更短、更直观） */
+function relPath(p: string | undefined, cwd: string): string {
+  if (!p) return "";
+  try {
+    if (isAbsolute(p)) {
+      const rel = relative(cwd, p);
+      if (rel && !rel.startsWith("..") && rel.length < p.length) return rel;
+    }
+  } catch {
+    // 保持原样
+  }
+  return p;
+}
+
+function firstLine(s: string): string {
+  const line = (s.split("\n").find((l) => l.trim().length > 0) ?? "").trim();
+  return line.replace(/\s+/g, " ");
+}
+
+function summarizeToolCall(toolName: string, args: any, cwd: string): string {
+  const a = (args ?? {}) as Record<string, any>;
+  switch (toolName) {
+    case "bash":
+    case "powershell": {
+      const cmd = typeof a.command === "string" ? firstLine(a.command) : "";
+      // "cd dir && cmd" → "cmd (in dir)"，省掉最啰嗦的前缀
+      const cd = cmd.match(/^cd\s+(\S+)\s*&&\s+(.+)$/);
+      if (cd) return `${truncate(cd[2])} (in ${cd[1]})`;
+      return truncate(cmd);
+    }
+    case "read": {
+      const p = relPath(a.path, cwd);
+      return a.offset && a.offset > 1 ? `${p} @${a.offset}` : p;
+    }
+    case "edit": {
+      const p = relPath(a.path, cwd);
+      const n = Array.isArray(a.edits) ? a.edits.length : 0;
+      return n > 0 ? `${p} · ${n} ${n === 1 ? "edit" : "edits"}` : p;
+    }
+    case "write":
+      return relPath(a.path, cwd);
+    case "grep": {
+      let s = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
+      if (a.path) s += ` in ${relPath(a.path, cwd)}`;
+      if (a.glob) s += ` (${a.glob})`;
+      return s;
+    }
+    case "find": {
+      let s = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
+      if (a.path) s += ` in ${relPath(a.path, cwd)}`;
+      return s;
+    }
+    case "ls": {
+      const p = relPath(a.path, cwd);
+      return p || ".";
+    }
+    default:
+      return truncate(JSON.stringify(a).slice(1, -1) || toolName);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// 完成状态（✓/✗ + 结果统计 + 耗时）
+// ---------------------------------------------------------------------------
+
+interface CallStatus {
+  hint?: string;
+  durationMs?: number;
+}
+
+/** per-row 渲染状态（ToolExecutionComponent 的 rendererState） */
+interface RowState {
+  startedAt?: number;
+  animInterval?: ReturnType<typeof setInterval>;
+  finalTick?: ReturnType<typeof setTimeout>;
+  status?: CallStatus;
+}
+
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
-
-/** 动画间隔（ms），与每帧时长一致 */
 const SPINNER_INTERVAL_MS = 100;
+/** 完成后用于刷新一次最终状态的延迟 */
+const FINAL_RENDER_DELAY_MS = 40;
 
-/** 所有运行中的动画定时器，用于 session 结束时统一清理 */
-const activeIntervals = new Set<ReturnType<typeof setInterval>>();
+/** 所有运行中的定时器，session 结束时统一清理 */
+const activeTimers = new Set<ReturnType<typeof setInterval>>();
+const activeTimeouts = new Set<ReturnType<typeof setTimeout>>();
+
+function clearTimers(state: RowState): void {
+  if (state.animInterval) {
+    clearInterval(state.animInterval);
+    activeTimers.delete(state.animInterval);
+    state.animInterval = undefined;
+  }
+  if (state.finalTick) {
+    clearTimeout(state.finalTick);
+    activeTimeouts.delete(state.finalTick);
+    state.finalTick = undefined;
+  }
+}
+
+function formatSeconds(ms: number): string {
+  const totalSec = ms / 1000;
+  if (totalSec < 1) return `${Math.max(0.1, Math.round(totalSec * 10) / 10)}s`;
+  if (totalSec < 60) return `${Math.round(totalSec)}s`;
+  const m = Math.floor(totalSec / 60);
+  const s = Math.round(totalSec % 60);
+  return `${m}m ${s}s`;
+}
+
+/** 把所有文本块拼接成结果文本（忽略图片块） */
+function resultText(result: { content: unknown[] }): string {
+  return (result.content ?? [])
+    .filter((c): c is { type: "text"; text: string } => (c as any)?.type === "text")
+    .map((c) => c.text)
+    .join("\n");
+}
+
+function countLines(text: string): number {
+  return text.split("\n").filter((l) => l.trim().length > 0).length;
+}
 
 /**
- * 占位符与动画主色：青色（标准 ANSI 36）。
- * 想换色改这里的色码即可，例如：
- *   亮青 truecolor  \x1b[38;2;0;215;255m （主题变量里的 #00d7ff）
- *   品红            \x1b[35m
+ * 从最终结果推导一行状态尾巴，例如：
+ *   bash 错误 → "exit 2" / "timeout 30s" / "error"
+ *   read      → "42 lines" / "lines 1-20/300" / "image"
+ *   grep/find → "12 matches" / "3 files" / "0 matches"
+ *   ls        → "24 items"
+ *   edit      → "2 blocks"
  */
-function cyan(text: string): string {
-  return `\x1b[36m${text}\x1b[39m`;
-}
+function computeStatusHint(toolName: string, result: { content: unknown[]; details: any }, isError: boolean): string | undefined {
+  const text = resultText(result);
+  const hasImage = (result.content ?? []).some((c) => (c as any)?.type === "image");
 
-function placeholder(theme: Theme, context: ToolRenderContext): Component {
-  const state = context.state as {
-    animInterval?: ReturnType<typeof setInterval>;
-    startedAt?: number;
-  };
+  if (isError) {
+    const exit = text.match(/Command exited with code (\d+)/);
+    if (exit) return `exit ${exit[1]}`;
+    const timeout = text.match(/timed out after (\d+) seconds/);
+    if (timeout) return `timeout ${timeout[1]}s`;
+    return "error";
+  }
 
-  if (context.isPartial) {
-    // 命令还在跑：启动动画定时器（只启动一次），每帧触发重绘
-    if (!state.animInterval) {
-      state.startedAt = Date.now();
-      const iv = setInterval(() => context.invalidate(), SPINNER_INTERVAL_MS);
-      state.animInterval = iv;
-      activeIntervals.add(iv);
+  switch (toolName) {
+    case "bash":
+      return undefined; // 成功 bash 无需统计
+    case "read": {
+      if (hasImage) return "image";
+      const range = text.match(/\[Showing lines (\d+)-(\d+) of (\d+)/);
+      if (range) return `lines ${range[1]}-${range[2]}/${range[3]}`;
+      const more = text.match(/\[(\d+) more lines? in file/);
+      if (more) return `${more[1]} more`;
+      const n = countLines(text);
+      return n > 0 ? `${n} lines` : undefined;
     }
-
-    const elapsedSec = Math.max(
-      0,
-      Math.round((Date.now() - (state.startedAt ?? Date.now())) / 1000),
-    );
-    const frame =
-      SPINNER_FRAMES[Math.floor(Date.now() / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length];
-
-    let text = theme.bold(cyan("⚙ tool call"));
-    text += " " + cyan(frame);
-    text += " " + theme.fg("dim", `${elapsedSec}s`);
-    return new Text(text, 0, 0);
+    case "grep": {
+      if (text.trim() === "No matches found") return "0 matches";
+      const n = countLines(text);
+      return n > 0 ? `${n} matches` : "0 matches";
+    }
+    case "find": {
+      if (text.trim() === "No files found matching pattern") return "0 files";
+      const n = countLines(text);
+      return n > 0 ? `${n} files` : "0 files";
+    }
+    case "ls": {
+      if (text.trim() === "(empty directory)") return "0 items";
+      const n = countLines(text);
+      return n > 0 ? `${n} items` : undefined;
+    }
+    case "edit": {
+      const blocks = text.match(/Successfully replaced (\d+) block\(s\)/);
+      if (blocks) return `${blocks[1]} block${blocks[1] === "1" ? "" : "s"}`;
+      return "done";
+    }
+    case "write":
+      return undefined;
+    default:
+      return undefined;
   }
-
-  // 命令结束：清理动画定时器，恢复静态占位符
-  if (state.animInterval) {
-    clearInterval(state.animInterval);
-    activeIntervals.delete(state.animInterval);
-    state.animInterval = undefined;
-  }
-  return new Text(theme.bold(cyan("⚙ tool call")), 0, 0);
 }
 
-/** 停止动画（切到展开/完整模式时交给内置渲染器） */
-function stopSpinner(context: ToolRenderContext): void {
-  const state = context.state as { animInterval?: ReturnType<typeof setInterval> };
-  if (state.animInterval) {
-    clearInterval(state.animInterval);
-    activeIntervals.delete(state.animInterval);
-    state.animInterval = undefined;
+// ---------------------------------------------------------------------------
+// 占位符渲染：一行 = 图标 + 工具名 + 摘要 + 状态
+// ---------------------------------------------------------------------------
+
+function formatLine(
+  theme: Theme,
+  toolName: string,
+  summary: string,
+  status?: { mark: "running" | "ok" | "error"; suffix?: string },
+): string {
+  const style = getStyle(toolName);
+  const head = useIcons ? `${style.icon} ${style.label}` : style.label;
+  let text = `${theme.fg("dim", head)}${theme.fg("dim", " · ")}${theme.fg("accent", summary)}`;
+
+  if (status?.mark === "running") {
+    text += " " + theme.fg("accent", status.suffix ?? "");
+  } else if (status?.mark === "ok") {
+    text += " " + theme.fg("success", "✓");
+    if (status.suffix) text += " " + theme.fg("dim", status.suffix);
+  } else if (status?.mark === "error") {
+    text += " " + theme.fg("error", "✗");
+    if (status.suffix) text += " " + theme.fg("dim", status.suffix);
   }
+  return text;
+}
+
+function renderLine(
+  theme: Theme,
+  toolName: string,
+  summary: string,
+  status?: { mark: "running" | "ok" | "error"; suffix?: string },
+): Component {
+  return new Text(formatLine(theme, toolName, summary, status), 0, 0);
+}
+
+/**
+ * quiet 模式的 call 行渲染。
+ * 状态机（per-row state）：
+ *   执行前            → 静态行
+ *   执行中(isPartial) → 动画行（spinner + 耗时）
+ *   刚完成(第一帧)    → 静态行 + 安排一次延迟重绘
+ *   延迟帧(状态就绪)  → 最终行（✓/✗ + 统计 + 耗时），并停止一切定时器
+ */
+function renderQuietCall(
+  toolName: string,
+  theme: Theme,
+  context: RenderContext,
+): Component {
+  const state = context.state as RowState;
+  const summary = summarizeToolCall(toolName, context.args, context.cwd);
+
+  // 已完成且状态就绪：渲染最终行（优先级最高，避免 isPartial 滞后时卡在动画）
+  if (state.status) {
+    clearTimers(state);
+    const { hint, durationMs } = state.status;
+    const dur = durationMs !== undefined ? formatSeconds(durationMs) : undefined;
+    const suffix = hint && dur ? `${hint} · ${dur}` : (hint ?? dur);
+    return renderLine(theme, toolName, summary, {
+      mark: context.isError ? "error" : "ok",
+      suffix,
+    });
+  }
+
+  // 执行中：启动动画（只启动一次）
+  if (context.isPartial) {
+    if (context.executionStarted) {
+      state.startedAt ??= Date.now();
+      if (!state.animInterval) {
+        const iv = setInterval(() => context.invalidate(), SPINNER_INTERVAL_MS);
+        state.animInterval = iv;
+        activeTimers.add(iv);
+      }
+      const elapsed = formatSeconds(Date.now() - state.startedAt);
+      const frame =
+        SPINNER_FRAMES[
+          Math.floor(Date.now() / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length
+        ];
+      return renderLine(theme, toolName, summary, {
+        mark: "running",
+        suffix: `${frame} ${elapsed}`,
+      });
+    }
+    // 参数就绪但尚未开始执行：静态行
+    return renderLine(theme, toolName, summary);
+  }
+
+  // 刚结束的过渡帧：安排一次延迟重绘，renderResult 会把统计写进 state.status
+  if (!state.finalTick) {
+    state.finalTick = setTimeout(() => context.invalidate(), FINAL_RENDER_DELAY_MS);
+    activeTimeouts.add(state.finalTick);
+  }
+  return renderLine(theme, toolName, summary);
+}
+
+/** quiet 模式的 result 渲染：结果不显示任何内容，只把统计抽到 state 里 */
+function renderQuietResult(
+  toolName: string,
+  result: any,
+  options: RenderResultOptions,
+  theme: Theme,
+  context: RenderContext,
+): Component {
+  void theme;
+  const state = context.state as RowState;
+
+  if (!options.isPartial) {
+    // 最终结果：计算完成状态（只算一次）
+    if (!state.status) {
+      const finishedAt = Date.now();
+      state.status = {
+        hint: computeStatusHint(toolName, result, context.isError),
+        durationMs: state.startedAt ? finishedAt - state.startedAt : undefined,
+      };
+    }
+    // 完成后的过渡帧由 renderCall 的 finalTick 驱动重绘
+  }
+  return new Text("", 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -222,10 +560,11 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
     renderCall(args, theme, context) {
       const builtin = getDefinitions(context.cwd)[name];
       if (!hidden || context.expanded) {
-        stopSpinner(context); // 展开/完整模式：动画交给内置渲染器
+        // 展开/完整模式：动画与占位交给内置渲染器
+        clearTimers(context.state as RowState);
         return delegateCall(builtin, args, theme, context);
       }
-      return placeholder(theme, context);
+      return renderQuietCall(name, theme, context);
     },
 
     renderResult(result, options, theme, context) {
@@ -233,8 +572,7 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
       if (!hidden || context.expanded) {
         return delegateResult(builtin, result, options, theme, context);
       }
-      // quiet 模式：不显示任何输出（空 Text 渲染为 0 行）
-      return new Text("", 0, 0);
+      return renderQuietResult(name, result as never, options, theme, context);
     },
   });
 }
@@ -244,7 +582,9 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
 // ---------------------------------------------------------------------------
 
 export default function (pi: ExtensionAPI) {
-  // 可选 CLI flag：启动即完整显示
+  loadConfig();
+
+  // 可选 CLI flag：启动即完整显示（优先级高于配置文件）
   pi.registerFlag("show-tools", {
     description: "Start with tool call details shown (disable quiet-tools hiding)",
     type: "boolean",
@@ -258,9 +598,14 @@ export default function (pi: ExtensionAPI) {
 
   // 切换 quiet / full
   pi.registerCommand("toggletools", {
-    description: "Toggle tool call display between quiet (placeholder) and full detail",
-    handler: async (_args, ctx) => {
-      hidden = !hidden;
+    description:
+      "Toggle tool call display between quiet (placeholder) and full detail (add quiet|full to set explicitly)",
+    handler: async (args, ctx) => {
+      const mode = (args ?? "").trim().toLowerCase();
+      if (mode === "quiet") hidden = true;
+      else if (mode === "full" || mode === "show") hidden = false;
+      else hidden = !hidden;
+      saveConfig();
 
       if (ctx.mode === "tui") {
         // 翻转全局展开状态两次，强制所有已渲染的工具行重绘
@@ -278,12 +623,10 @@ export default function (pi: ExtensionAPI) {
 
   // 清理 per-row 渲染缓存与运行中的动画/计时定时器
   pi.on("session_shutdown", () => {
-    for (const iv of activeIntervals) clearInterval(iv);
-    activeIntervals.clear();
-    for (const cache of rowCaches.values()) {
-      const s = cache.state as { interval?: ReturnType<typeof setInterval> };
-      if (s.interval) clearInterval(s.interval);
-    }
+    for (const iv of activeTimers) clearInterval(iv);
+    activeTimers.clear();
+    for (const t of activeTimeouts) clearTimeout(t);
+    activeTimeouts.clear();
     rowCaches.clear();
   });
 }

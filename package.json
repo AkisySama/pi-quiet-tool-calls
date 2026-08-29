@@ -1,7 +1,7 @@
 {
   "name": "pi-quiet-tool-calls",
-  "version": "1.0.0",
-  "description": "Quiet tool display for pi: collapse bash/read/write/edit/grep/find/ls calls into a subtle cyan placeholder with a live spinner — no more giant green/red boxes",
+  "version": "2.0.0",
+  "description": "Quiet tool display for pi: collapse bash/read/write/edit/grep/find/ls into one-line status rows with per-tool icons, summaries, live spinner, result stats and error codes",
   "keywords": [
     "pi-package",
     "pi",
@@ -9,7 +9,8 @@
     "tui",
     "quiet",
     "minimal",
-    "tool-call"
+    "tool-call",
+    "status-line"
   ],
   "author": "AkisySama",
   "repository": {
@@ -30,5 +31,11 @@
   "peerDependencies": {
     "@earendil-works/pi-coding-agent": "*",
     "@earendil-works/pi-tui": "*"
+  },
+  "devDependencies": {
+    "jiti": "^2.7.0"
+  },
+  "scripts": {
+    "test": "node tests/smoke.mjs && node tests/render.mjs"
   }
 }
