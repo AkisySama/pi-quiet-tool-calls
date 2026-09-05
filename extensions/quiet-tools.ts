@@ -27,6 +27,7 @@
  *     "hidden": true,                 // 默认是否隐藏细节
  *     "icons": true,                  // 是否显示 emoji 图标（false 用纯文本标签）
  *     "maxSummary": 60,               // 摘要最大字符数
+ *     "expandHint": true,             // 完成行是否显示 Ctrl+O 展开提示
  *     "style": {                      // 覆盖图标/标签
  *       "read":  { "icon": "📄", "label": "Read" },
  *       "bash":  { "icon": "⚡", "label": "Shell" }
@@ -36,6 +37,9 @@
  * 说明：
  *   - 只影响 TUI 显示；工具执行、LLM 上下文与会话文件完全不变。
  *   - 颜色全部取自当前主题变量（accent/success/error/dim），自动适配深浅主题。
+ *   - 已知限制：模型调用“未注册的工具名”（例如参数与工具名错位的畸形调用，
+ *     或被 --no-tools 禁用的工具）时，pi 没有对应的 ToolDefinition，
+ *     该行会由 pi 的默认渲染器（带边框的错误框）显示，插件无法接管。
  */
 
 import type {
@@ -53,6 +57,7 @@ import {
   createPowerShellToolDefinition,
   createReadToolDefinition,
   createWriteToolDefinition,
+  keyHint,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
 import { Text } from "@earendil-works/pi-tui";
@@ -70,6 +75,8 @@ let hidden = true;
 let useIcons = true;
 /** 摘要最大字符数 */
 let maxSummary = 60;
+/** 完成行是否显示 Ctrl+O 展开提示 */
+let expandHint = true;
 
 interface ToolStyle {
   icon: string;
@@ -96,6 +103,7 @@ interface Config {
   hidden?: boolean;
   icons?: boolean;
   maxSummary?: number;
+  expandHint?: boolean;
   style?: Record<string, { icon?: string; label?: string }>;
 }
 
@@ -108,6 +116,7 @@ function loadConfig(): void {
     if (typeof cfg.icons === "boolean") useIcons = cfg.icons;
     if (typeof cfg.maxSummary === "number" && cfg.maxSummary > 0)
       maxSummary = Math.floor(cfg.maxSummary);
+    if (typeof cfg.expandHint === "boolean") expandHint = cfg.expandHint;
     for (const [name, s] of Object.entries(cfg.style ?? {})) {
       const base = DEFAULT_STYLES[name] ?? FALLBACK_STYLE;
       styles[name] = { ...base, ...s };
@@ -120,6 +129,15 @@ function loadConfig(): void {
 function saveConfig(): void {
   try {
     mkdirSync(dirname(CONFIG_PATH), { recursive: true });
+    // 只持久化非默认值：默认样式/开关不出现在文件中，删除文件即恢复默认
+    const styleOverrides = Object.fromEntries(
+      Object.entries(styles)
+        .filter(([name, v]) => {
+          const base = DEFAULT_STYLES[name];
+          return base !== undefined && (base.icon !== v.icon || base.label !== v.label);
+        })
+        .map(([k, v]) => [k, { ...v }]),
+    );
     writeFileSync(
       CONFIG_PATH,
       JSON.stringify(
@@ -127,9 +145,8 @@ function saveConfig(): void {
           hidden,
           icons: useIcons,
           maxSummary,
-          style: Object.fromEntries(
-            Object.entries(styles).map(([k, v]) => [k, { ...v }]),
-          ),
+          expandHint,
+          ...(Object.keys(styleOverrides).length > 0 ? { style: styleOverrides } : {}),
         },
         null,
         2,
@@ -157,6 +174,19 @@ type RenderContext = Parameters<NonNullable<AnyToolDef["renderCall"]>>[2];
 type RenderResultOptions = Parameters<NonNullable<AnyToolDef["renderResult"]>>[1];
 
 const definitionCache = new Map<string, Record<BuiltinName, AnyToolDef>>();
+/** 缓存上限（防止 cwd 频繁变化时无限增长） */
+const MAX_DEFINITIONS = 8;
+
+/** 带 LRU 淘汰的 set：命中/写入时重插到尾部，超出上限时淘汰最旧项 */
+function setBounded<K, V>(map: Map<K, V>, key: K, value: V, max: number): void {
+  map.delete(key);
+  map.set(key, value);
+  while (map.size > max) {
+    const oldest = map.keys().next().value;
+    if (oldest === undefined) break;
+    map.delete(oldest);
+  }
+}
 
 function getDefinitions(cwd: string): Record<BuiltinName, AnyToolDef> {
   let defs = definitionCache.get(cwd);
@@ -171,6 +201,10 @@ function getDefinitions(cwd: string): Record<BuiltinName, AnyToolDef> {
       find: createFindToolDefinition(cwd),
       ls: createLsToolDefinition(cwd),
     };
+    setBounded(definitionCache, cwd, defs, MAX_DEFINITIONS);
+  } else {
+    // 命中：重插以维持 LRU 顺序
+    definitionCache.delete(cwd);
     definitionCache.set(cwd, defs);
   }
   return defs;
@@ -188,11 +222,19 @@ interface RowCache {
 }
 
 const rowCaches = new Map<string, RowCache>();
+/** 缓存上限：只保留最近的行，长会话下避免无限增长 */
+const MAX_ROWS = 512;
 
 function getRowCache(toolCallId: string): RowCache {
   let cache = rowCaches.get(toolCallId);
   if (!cache) {
     cache = { state: {} };
+    setBounded(rowCaches, toolCallId, cache, MAX_ROWS);
+    // setBounded 可能已淘汰其他行，但当前 key 始终保留；读到的是最新值
+    cache = rowCaches.get(toolCallId) ?? cache;
+  } else {
+    // 命中：重插以维持 LRU 顺序，并修正被淘汰的旧引用
+    rowCaches.delete(toolCallId);
     rowCaches.set(toolCallId, cache);
   }
   return cache;
@@ -205,7 +247,9 @@ function delegateCall(
   context: RenderContext,
 ): Component {
   const cache = getRowCache(context.toolCallId);
-  const comp = builtin.renderCall!(args, theme, {
+  const render = builtin.renderCall;
+  if (!render) return renderQuietOnly("tool", args, theme, context);
+  const comp = render(args, theme, {
     ...context,
     state: cache.state,
     lastComponent: cache.callComp,
@@ -222,13 +266,29 @@ function delegateResult(
   context: RenderContext,
 ): Component {
   const cache = getRowCache(context.toolCallId);
-  const comp = builtin.renderResult!(result as never, options, theme, {
+  const render = builtin.renderResult;
+  if (!render) return new Text("", 0, 0);
+  const comp = render(result as never, options, theme, {
     ...context,
     state: cache.state,
     lastComponent: cache.resultComp,
   });
   cache.resultComp = comp;
   return comp;
+}
+
+/** renderCall/renderResult 缺失时的极简回退（防御性，正常不会走到） */
+function renderQuietOnly(
+  toolName: string,
+  args: unknown,
+  theme: Theme,
+  context: RenderContext,
+): Component {
+  return renderLine(
+    theme,
+    toolName,
+    summarizeToolCall(toolName, args, context.cwd),
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -342,6 +402,7 @@ function clearTimers(state: RowState): void {
 }
 
 function formatSeconds(ms: number): string {
+  if (!Number.isFinite(ms) || ms < 0) return "?";
   const totalSec = ms / 1000;
   if (totalSec < 1) return `${Math.max(0.1, Math.round(totalSec * 10) / 10)}s`;
   if (totalSec < 60) return `${Math.round(totalSec)}s`;
@@ -363,6 +424,49 @@ function countLines(text: string): number {
 }
 
 /**
+ * 判断是否是 pi 输出尾部附加的提示行，例如：
+ *   [200 entries limit reached. Use limit=400 for more]
+ *   [64KB limit reached]
+ *   [Some lines truncated to 2000 chars. Use read tool to see full lines]
+ * 统计结果数量时不应把这类行算进去。
+ */
+const NOTICE_RE =
+  /(limit reached|more lines? in file|more entries|KB limit reached|truncated to \d+ chars)/;
+
+function isNoticeLine(line: string): boolean {
+  const t = line.trim();
+  return t.startsWith("[") && t.endsWith("]") && NOTICE_RE.test(t);
+}
+
+/** 统计有效结果行数（忽略空行与 [...] 提示行） */
+function countContentLines(text: string): number {
+  return text
+    .split("\n")
+    .filter((l) => {
+      const t = l.trim();
+      return t.length > 0 && !isNoticeLine(t);
+    }).length;
+}
+
+/**
+ * 错误时的首行提示：优先取“跳出”堆栈信息的真实错误行，
+ * 例如 bash 的 `command not found`、read/ls 的 `Path not found: ...`。
+ * 格式类状态行（Command exited with code / timed out）单独匹配，不在这里。
+ */
+function firstErrorLine(text: string): string | undefined {
+  const line = text
+    .split("\n")
+    .map((l) => l.trim())
+    .find(
+      (l) =>
+        l.length > 0 &&
+        !/^(Command exited with code |Command timed out after |\[)/.test(l),
+    );
+  if (!line) return undefined;
+  return truncate(line, 40);
+}
+
+/**
  * 从最终结果推导一行状态尾巴，例如：
  *   bash 错误 → "exit 2" / "timeout 30s" / "error"
  *   read      → "42 lines" / "lines 1-20/300" / "image"
@@ -379,7 +483,7 @@ function computeStatusHint(toolName: string, result: { content: unknown[]; detai
     if (exit) return `exit ${exit[1]}`;
     const timeout = text.match(/timed out after (\d+) seconds/);
     if (timeout) return `timeout ${timeout[1]}s`;
-    return "error";
+    return firstErrorLine(text) ?? "error";
   }
 
   switch (toolName) {
@@ -396,17 +500,17 @@ function computeStatusHint(toolName: string, result: { content: unknown[]; detai
     }
     case "grep": {
       if (text.trim() === "No matches found") return "0 matches";
-      const n = countLines(text);
+      const n = countContentLines(text);
       return n > 0 ? `${n} matches` : "0 matches";
     }
     case "find": {
       if (text.trim() === "No files found matching pattern") return "0 files";
-      const n = countLines(text);
+      const n = countContentLines(text);
       return n > 0 ? `${n} files` : "0 files";
     }
     case "ls": {
       if (text.trim() === "(empty directory)") return "0 items";
-      const n = countLines(text);
+      const n = countContentLines(text);
       return n > 0 ? `${n} items` : undefined;
     }
     case "edit": {
@@ -430,6 +534,7 @@ function formatLine(
   toolName: string,
   summary: string,
   status?: { mark: "running" | "ok" | "error"; suffix?: string },
+  hint?: string,
 ): string {
   const style = getStyle(toolName);
   const head = useIcons ? `${style.icon} ${style.label}` : style.label;
@@ -440,9 +545,11 @@ function formatLine(
   } else if (status?.mark === "ok") {
     text += " " + theme.fg("success", "✓");
     if (status.suffix) text += " " + theme.fg("dim", status.suffix);
+    if (hint) text += " " + theme.fg("dim", hint);
   } else if (status?.mark === "error") {
     text += " " + theme.fg("error", "✗");
     if (status.suffix) text += " " + theme.fg("dim", status.suffix);
+    if (hint) text += " " + theme.fg("dim", hint);
   }
   return text;
 }
@@ -452,8 +559,18 @@ function renderLine(
   toolName: string,
   summary: string,
   status?: { mark: "running" | "ok" | "error"; suffix?: string },
+  hint?: string,
 ): Component {
-  return new Text(formatLine(theme, toolName, summary, status), 0, 0);
+  return new Text(formatLine(theme, toolName, summary, status, hint), 0, 0);
+}
+
+/** Ctrl+O 展开提示：优先用主题化的 keyHint，异常时回退纯文本 */
+function expandHintText(): string {
+  try {
+    return keyHint("app.tools.expand", "expand");
+  } catch {
+    return "Ctrl+O expand";
+  }
 }
 
 /**
@@ -478,10 +595,11 @@ function renderQuietCall(
     const { hint, durationMs } = state.status;
     const dur = durationMs !== undefined ? formatSeconds(durationMs) : undefined;
     const suffix = hint && dur ? `${hint} · ${dur}` : (hint ?? dur);
+    const hintText = expandHint && !context.expanded ? expandHintText() : undefined;
     return renderLine(theme, toolName, summary, {
       mark: context.isError ? "error" : "ok",
       suffix,
-    });
+    }, hintText);
   }
 
   // 执行中：启动动画（只启动一次）
@@ -621,12 +739,13 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // 清理 per-row 渲染缓存与运行中的动画/计时定时器
+  // 清理 per-row 渲染缓存、工具定义缓存与运行中的动画/计时定时器
   pi.on("session_shutdown", () => {
     for (const iv of activeTimers) clearInterval(iv);
     activeTimers.clear();
     for (const t of activeTimeouts) clearTimeout(t);
     activeTimeouts.clear();
     rowCaches.clear();
+    definitionCache.clear();
   });
 }

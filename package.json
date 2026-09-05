@@ -1,6 +1,6 @@
 {
   "name": "pi-quiet-tool-calls",
-  "version": "2.0.0",
+  "version": "2.1.0",
   "description": "Quiet tool display for pi: collapse bash/read/write/edit/grep/find/ls into one-line status rows with per-tool icons, summaries, live spinner, result stats and error codes",
   "keywords": [
     "pi-package",
@@ -32,7 +32,8 @@
     "@earendil-works/pi-tui": "*"
   },
   "devDependencies": {
-    "jiti": "^2.7.0"
+    "jiti": "^2.7.0",
+    "typescript": "^5.9.3"
   },
   "scripts": {
     "test": "node tests/smoke.mjs && node tests/render.mjs"

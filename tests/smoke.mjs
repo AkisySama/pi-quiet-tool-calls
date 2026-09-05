@@ -97,6 +97,7 @@ console.log("bash:");
   out = lineText(bash.renderCall(ctx.args, theme, ctx));
   ok("final line shows ✓", out.includes("✓"), JSON.stringify(out));
   ok("final line shows duration", /✓\s\d+(\.\d+)?[sm]/.test(out), JSON.stringify(out));
+  ok("final line shows expand hint", out.toLowerCase().includes("expand"), JSON.stringify(out));
   ok("timers cleared", st.animInterval === undefined && st.finalTick === undefined);
 }
 
@@ -185,11 +186,37 @@ console.log("result stats:");
   out = await statFor(read, { content: [{ type: "text", text: "x\n\n[Showing lines 1-5 of 200. Use offset=6 to continue.]" }], details: {} });
   ok("read truncated range", out.includes("lines 1-5/200"), JSON.stringify(out));
 
+  out = await statFor(ls, { content: [{ type: "text", text: "a\nb\n\n[100 entries limit reached. Use limit=200 for more]" }], details: {} });
+  ok("ls ignores notice line", out.includes("2 items"), JSON.stringify(out));
+
   out = await statFor(edit, { content: [{ type: "text", text: "Successfully replaced 2 block(s) in a.ts." }], details: {} });
   ok("edit 2 blocks", out.includes("2 blocks"), JSON.stringify(out));
 
   out = await statFor(ls, { content: [{ type: "text", text: "(empty directory)" }], details: {} });
   ok("ls 0 items", out.includes("0 items"), JSON.stringify(out));
+}
+
+console.log("error hints:");
+{
+  async function errorFor(tool, result) {
+    const st = {};
+    const ctx = makeCtx(st, false, true, true);
+    ctx.args = tool === "read" ? { path: "a.md" } : { command: "x" };
+    tool.renderResult(result, { expanded: false, isPartial: false }, theme, ctx);
+    await new Promise((r) => setTimeout(r, 60));
+    return lineText(tool.renderCall(ctx.args, theme, ctx));
+  }
+  let out = await errorFor(read, {
+    content: [{ type: "text", text: "Path not found: /Users/akisy/Projects/x/a.md" }],
+    details: {},
+  });
+  ok("read error shows real first line", out.includes("Path not found"), JSON.stringify(out));
+
+  out = await errorFor(bash, {
+    content: [{ type: "text", text: "bash: npm: command not found\nCommand exited with code 127" }],
+    details: {},
+  });
+  ok("bash exit code still wins", out.includes("exit 127"), JSON.stringify(out));
 }
 
 console.log("config persistence:");
@@ -205,7 +232,9 @@ console.log("config persistence:");
     },
   };
   await commands.toggletools.handler("full", cmdCtx);
-  ok("toggletools full persists config", existsSync(cfgPath) && JSON.parse(readFileSync(cfgPath, "utf8")).hidden === false, JSON.stringify(readFileSync(cfgPath, "utf8")));
+  const saved1 = JSON.parse(readFileSync(cfgPath, "utf8"));
+  ok("toggletools full persists config", saved1.hidden === false, JSON.stringify(saved1));
+  ok("config persists expandHint and no default styles", saved1.expandHint === true && saved1.style === undefined, JSON.stringify(saved1));
   await commands.toggletools.handler("", cmdCtx);
   ok("toggletools toggle-back persists config", JSON.parse(readFileSync(cfgPath, "utf8")).hidden === true);
 }

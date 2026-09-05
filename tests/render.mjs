@@ -81,6 +81,7 @@ ok("final frame transitional", !out.includes("✓") && out.includes("npm test"),
 await new Promise((r) => setTimeout(r, 80));
 out = render(c);
 ok("final ✓ line", out.includes("✓") && /✓\s+\d+(\.\d+)?[sm]/.test(out), JSON.stringify(out));
+ok("expand hint present", out.toLowerCase().includes("expand"), JSON.stringify(out));
 ok("no giant boxes", !out.includes("┌") && !out.includes("└"), JSON.stringify(out));
 
 // --- error flow ---
