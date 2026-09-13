@@ -2,14 +2,12 @@
  * pi-quiet-tool-calls v2 — 状态化工具折叠（pi 扩展）
  *
  * 默认状态（quiet）：
- *   每个工具调用折叠成一行，图标 + 工具名 + 一句话摘要，一眼看出 agent 正在做什么：
- *     📖 Read  · Sources/App.swift
- *     💻 Bash  · npm test
- *     ✏️ Edit  · src/index.ts · 3 edits
- *     🔍 Grep  · applyIconChoice|AppIcon... in Sources
- *   - 执行中：行尾旋转动画 + 已耗时        💻 Bash · npm test ⠹ 3s
- *   - 完成：  ✓ 结果统计 + 耗时            🔍 Grep · "x" in src ✓ 42 matches · 0.4s
- *   - 出错：  ✗ 错误信息                   💻 Bash · npm run build ✗ exit 2 · 0.4s
+ *   默认 minimal 外观：状态符号 + 对齐工具名 + 摘要，结果与耗时靠右。
+ *     ✓  Read        Sources/App.swift          42 lines · 0.1s
+ *     ⠹  Bash        npm test                                3s
+ *     ×  Bash        npm run build                exit 2 · 0.4s
+ *   已完成记录使用中性色；执行中使用强调色，失败状态与原因使用错误色。
+ *   appearance: "emoji" 可恢复工具 emoji 与原有布局。
  *   输出内容、绿色/红色大框全部隐藏。
  *
  * 展开查看：
@@ -25,7 +23,8 @@
  * 配置文件 ~/.pi/quiet-tools.json（可选，自动创建，删除即恢复默认）：
  *   {
  *     "hidden": true,                 // 默认是否隐藏细节
- *     "icons": true,                  // 是否显示 emoji 图标（false 用纯文本标签）
+ *     "appearance": "minimal",        // minimal（默认）或 emoji
+ *     "icons": true,                  // emoji 外观下是否显示工具图标
  *     "maxSummary": 60,               // 摘要最大字符数
  *     "expandHint": true,             // 完成行是否显示 Ctrl+O 展开提示
  *     "style": {                      // 覆盖图标/标签
@@ -60,7 +59,7 @@ import {
   keyHint,
 } from "@earendil-works/pi-coding-agent";
 import type { Component } from "@earendil-works/pi-tui";
-import { Text } from "@earendil-works/pi-tui";
+import { Text, truncateToWidth, visibleWidth } from "@earendil-works/pi-tui";
 import { isAbsolute, relative, dirname, join } from "node:path";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -71,7 +70,9 @@ import { homedir } from "node:os";
 
 /** true = quiet（隐藏细节，默认），false = 完整显示 */
 let hidden = true;
-/** 是否显示 emoji 图标 */
+/** 默认使用状态符号；emoji 外观保留原有工具图标。 */
+let appearance: "minimal" | "emoji" = "minimal";
+/** emoji 外观下是否显示工具图标 */
 let useIcons = true;
 /** 摘要最大字符数 */
 let maxSummary = 60;
@@ -101,6 +102,7 @@ let styles: Record<string, ToolStyle> = { ...DEFAULT_STYLES };
 
 interface Config {
   hidden?: boolean;
+  appearance?: "minimal" | "emoji";
   icons?: boolean;
   maxSummary?: number;
   expandHint?: boolean;
@@ -110,9 +112,16 @@ interface Config {
 const CONFIG_PATH = join(homedir(), CONFIG_DIR_NAME, "quiet-tools.json");
 
 function loadConfig(): void {
+  hidden = true;
+  appearance = "minimal";
+  useIcons = true;
+  maxSummary = 60;
+  expandHint = true;
+  styles = { ...DEFAULT_STYLES };
   try {
     const cfg = JSON.parse(readFileSync(CONFIG_PATH, "utf8")) as Config;
     if (typeof cfg.hidden === "boolean") hidden = cfg.hidden;
+    if (cfg.appearance === "minimal" || cfg.appearance === "emoji") appearance = cfg.appearance;
     if (typeof cfg.icons === "boolean") useIcons = cfg.icons;
     if (typeof cfg.maxSummary === "number" && cfg.maxSummary > 0)
       maxSummary = Math.floor(cfg.maxSummary);
@@ -136,16 +145,20 @@ function saveConfig(): void {
           const base = DEFAULT_STYLES[name];
           return base !== undefined && (base.icon !== v.icon || base.label !== v.label);
         })
-        .map(([k, v]) => [k, { ...v }]),
+        .map(([k, v]) => [k, {
+          ...(v.icon !== DEFAULT_STYLES[k].icon ? { icon: v.icon } : {}),
+          ...(v.label !== DEFAULT_STYLES[k].label ? { label: v.label } : {}),
+        }]),
     );
     writeFileSync(
       CONFIG_PATH,
       JSON.stringify(
         {
-          hidden,
-          icons: useIcons,
-          maxSummary,
-          expandHint,
+          ...(!hidden ? { hidden } : {}),
+          ...(appearance !== "minimal" ? { appearance } : {}),
+          ...(!useIcons ? { icons: useIcons } : {}),
+          ...(maxSummary !== 60 ? { maxSummary } : {}),
+          ...(!expandHint ? { expandHint } : {}),
           ...(Object.keys(styleOverrides).length > 0 ? { style: styleOverrides } : {}),
         },
         null,
@@ -297,8 +310,9 @@ function renderQuietOnly(
 
 function truncate(s: string, n = maxSummary): string {
   const flat = s.replace(/[\r\n\t]+/g, " ").trim();
-  if (flat.length <= n) return flat;
-  return `${flat.slice(0, Math.max(1, n - 1))}…`;
+  const chars = Array.from(flat);
+  if (chars.length <= n) return flat;
+  return `${chars.slice(0, Math.max(0, n - 1)).join("")}…`;
 }
 
 /** 使路径相对于 cwd（更短、更直观） */
@@ -320,7 +334,19 @@ function firstLine(s: string): string {
   return line.replace(/\s+/g, " ");
 }
 
-function summarizeToolCall(toolName: string, args: any, cwd: string): string {
+interface PathSummary {
+  prefix: string;
+  path: string;
+  suffix: string;
+}
+
+type ToolSummary = string | PathSummary;
+
+function pathSummary(path: string, suffix = "", prefix = ""): PathSummary {
+  return { prefix, path, suffix };
+}
+
+function summarizeToolCall(toolName: string, args: any, cwd: string): ToolSummary {
   const a = (args ?? {}) as Record<string, any>;
   switch (toolName) {
     case "bash":
@@ -333,33 +359,103 @@ function summarizeToolCall(toolName: string, args: any, cwd: string): string {
     }
     case "read": {
       const p = relPath(a.path, cwd);
-      return a.offset && a.offset > 1 ? `${p} @${a.offset}` : p;
+      return pathSummary(p, a.offset && a.offset > 1 ? ` @${a.offset}` : "");
     }
     case "edit": {
       const p = relPath(a.path, cwd);
       const n = Array.isArray(a.edits) ? a.edits.length : 0;
-      return n > 0 ? `${p} · ${n} ${n === 1 ? "edit" : "edits"}` : p;
+      return pathSummary(p, n > 0 ? ` · ${n} ${n === 1 ? "edit" : "edits"}` : "");
     }
     case "write":
-      return relPath(a.path, cwd);
+      return pathSummary(relPath(a.path, cwd));
     case "grep": {
-      let s = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
-      if (a.path) s += ` in ${relPath(a.path, cwd)}`;
-      if (a.glob) s += ` (${a.glob})`;
-      return s;
+      const pattern = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
+      const glob = a.glob ? ` (${a.glob})` : "";
+      return a.path ? pathSummary(relPath(a.path, cwd), glob, `${pattern} in `) : pattern + glob;
     }
     case "find": {
-      let s = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
-      if (a.path) s += ` in ${relPath(a.path, cwd)}`;
-      return s;
+      const pattern = truncate(String(a.pattern ?? ""), Math.min(40, maxSummary));
+      return a.path ? pathSummary(relPath(a.path, cwd), "", `${pattern} in `) : pattern;
     }
     case "ls": {
       const p = relPath(a.path, cwd);
-      return p || ".";
+      return pathSummary(p || ".");
     }
     default:
       return truncate(JSON.stringify(a).slice(1, -1) || toolName);
   }
+}
+
+const graphemes = new Intl.Segmenter(undefined, { granularity: "grapheme" });
+
+function middleEllipsis(text: string, fits: (text: string) => boolean): string {
+  if (fits(text)) return text;
+  if (!fits("…")) return "";
+  const chars = Array.from(graphemes.segment(text), part => part.segment);
+  // Keep both the beginning and the extension when the basename itself is too long.
+  let left = 0;
+  let right = 0;
+  while (left + right < chars.length) {
+    const nextLeft = left + (left <= right ? 1 : 0);
+    const nextRight = right + (left > right ? 1 : 0);
+    const candidate = chars.slice(0, nextLeft).join("") + "…" + chars.slice(chars.length - nextRight).join("");
+    if (!fits(candidate)) break;
+    left = nextLeft;
+    right = nextRight;
+  }
+  return chars.slice(0, left).join("") + "…" + chars.slice(chars.length - right).join("");
+}
+
+function splitPath(path: string): [string, string] {
+  const withoutTrailingSlash = path.replace(/[\\/]+$/, "");
+  const boundary = Math.max(withoutTrailingSlash.lastIndexOf("/"), withoutTrailingSlash.lastIndexOf("\\"));
+  return [path.slice(0, boundary + 1), path.slice(boundary + 1)];
+}
+
+function compactPath(path: string, fits: (text: string) => boolean): string {
+  if (fits(path)) return path;
+  const [directory, name] = splitPath(path);
+  const shortenName = () => {
+    const dot = name.lastIndexOf(".");
+    const extension = dot > 0 ? name.slice(dot) : "";
+    if (extension && fits("…" + extension)) {
+      return middleEllipsis(name.slice(0, dot), text => fits(text + extension)) + extension;
+    }
+    return middleEllipsis(name, fits);
+  };
+  if (!directory) return shortenName();
+  const separator = directory.slice(-1);
+  let compact = `…${separator}${name}`;
+  if (!fits(compact)) return shortenName();
+  let prefix = "";
+  // Omit whole middle directories, retaining as much of the project prefix as fits.
+  const parts = directory.match(/[^\\/]*[\\/]/g) ?? [];
+  for (const part of parts.slice(0, -1)) {
+    prefix += part;
+    const candidate = `${prefix}…${separator}${name}`;
+    if (!fits(candidate)) break;
+    compact = candidate;
+  }
+  return compact;
+}
+
+function renderSummary(summary: ToolSummary, width: number, theme: Theme, color: "accent" | "text"): string {
+  if (typeof summary === "string") return theme.fg(color, truncateToWidth(truncate(summary), width, "…"));
+  const flatten = (value: string) => value.replace(/[\r\n\t]+/g, " ");
+  let prefix = flatten(summary.prefix);
+  const path = flatten(summary.path);
+  const suffix = flatten(summary.suffix);
+  const fits = (text: string) => visibleWidth(text) <= width && Array.from(text).length <= maxSummary;
+  const [, name] = splitPath(path);
+  // File names and line numbers take precedence over a search prefix.
+  if (!fits(prefix + name + suffix)) {
+    prefix = middleEllipsis(prefix.trimEnd(), text => fits(text + " " + name + suffix));
+    if (prefix) prefix += " ";
+  }
+  const compact = compactPath(path, text => fits(prefix + text + suffix));
+  if (!compact) return theme.fg(color, truncateToWidth(truncate(name + suffix), width, "…"));
+  const [directory, basename] = splitPath(compact);
+  return theme.fg(color, prefix) + theme.fg("dim", directory) + theme.fg(color, basename) + theme.fg("dim", suffix);
 }
 
 // ---------------------------------------------------------------------------
@@ -378,6 +474,9 @@ interface RowState {
   finalTick?: ReturnType<typeof setTimeout>;
   status?: CallStatus;
 }
+
+/** Only the most recently completed row offers the global expand shortcut. */
+let latestCompletedState: RowState | undefined;
 
 const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_INTERVAL_MS = 100;
@@ -420,7 +519,18 @@ function resultText(result: { content: unknown[] }): string {
 }
 
 function countLines(text: string): number {
-  return text.split("\n").filter((l) => l.trim().length > 0).length;
+  if (text.length === 0) return 0;
+  // A trailing newline terminates the last line; interior blank lines still count.
+  return text.split("\n").length - (text.endsWith("\n") ? 1 : 0);
+}
+
+function countGrepMatches(text: string): number {
+  return text.split("\n").filter((line) => {
+    // pi formats matches as path:N: text and context as path-N- text.
+    // Inspect the first location marker so context containing "file:1:" stays context.
+    const location = line.match(/^.+?(?::(\d+):|-(\d+)- )/);
+    return location?.[1] !== undefined;
+  }).length;
 }
 
 /**
@@ -500,7 +610,7 @@ function computeStatusHint(toolName: string, result: { content: unknown[]; detai
     }
     case "grep": {
       if (text.trim() === "No matches found") return "0 matches";
-      const n = countContentLines(text);
+      const n = countGrepMatches(text);
       return n > 0 ? `${n} matches` : "0 matches";
     }
     case "find": {
@@ -526,42 +636,106 @@ function computeStatusHint(toolName: string, result: { content: unknown[]; detai
 }
 
 // ---------------------------------------------------------------------------
-// 占位符渲染：一行 = 图标 + 工具名 + 摘要 + 状态
+// 占位符渲染：minimal 用状态符号与对齐列，emoji 保留原有布局
 // ---------------------------------------------------------------------------
 
-function formatLine(
+interface LineStatus {
+  mark: "running" | "ok" | "error";
+  suffix?: string;
+  frame?: string;
+}
+
+function formatMinimalLine(
+  width: number,
   theme: Theme,
   toolName: string,
-  summary: string,
-  status?: { mark: "running" | "ok" | "error"; suffix?: string },
+  summary: ToolSummary,
+  status?: LineStatus,
+  hint?: string,
+): string {
+  const color = status?.mark === "running" ? "accent" : status?.mark === "error" ? "error" : "dim";
+  const symbol = status?.mark === "running" ? status.frame ?? SPINNER_FRAMES[0]
+    : status?.mark === "ok" ? "✓" : status?.mark === "error" ? "×" : "·";
+  const marker = theme.fg(color, symbol);
+  if (width <= 2) return truncateToWidth(marker, width);
+
+  const label = getStyle(toolName).label.replace(/[\r\n\t]+/g, " ");
+  // Keep a shared label column in wide terminals, and reclaim padding when narrow.
+  const labelWidth = width >= 60
+    ? Math.min(16, Math.max(...TOOL_NAMES.map(name => visibleWidth(getStyle(name).label))))
+    : visibleWidth(label);
+  const head = marker + "  " + theme.fg("dim", truncateToWidth(label, labelWidth, "…", true));
+  const summaryColor = status?.mark === "running" ? "accent" : "text";
+  const brief = renderSummary(summary, width, theme, summaryColor);
+  let tail = status?.suffix ? theme.fg(status.mark === "error" ? "error" : "dim", status.suffix) : "";
+  if (hint && visibleWidth(head + "  " + brief + "  " + tail + "  " + hint) <= width) {
+    tail += (tail ? "  " : "") + theme.fg("dim", hint);
+  }
+
+  const budget = width - visibleWidth(head) - (tail ? visibleWidth(tail) + 4 : 2);
+  if (budget >= 1) {
+    const text = head + "  " + renderSummary(summary, budget, theme, summaryColor);
+    return tail ? text + " ".repeat(width - visibleWidth(text + tail)) + tail : text;
+  }
+  // Keep the status and result visible when there is no room for a summary.
+  const headBudget = width - visibleWidth(tail) - 2;
+  if (headBudget >= 4) return truncateToWidth(head, headBudget) + "  " + tail;
+  return marker + " " + truncateToWidth(tail || label, width - 2);
+}
+
+function formatEmojiLine(
+  width: number,
+  theme: Theme,
+  toolName: string,
+  summary: ToolSummary,
+  status?: LineStatus,
   hint?: string,
 ): string {
   const style = getStyle(toolName);
-  const head = useIcons ? `${style.icon} ${style.label}` : style.label;
-  let text = `${theme.fg("dim", head)}${theme.fg("dim", " · ")}${theme.fg("accent", summary)}`;
+  const head = theme.fg("dim", (useIcons ? `${style.icon} ${style.label}` : style.label)
+    .replace(/[\r\n\t]+/g, " "));
+  let tail = "";
 
   if (status?.mark === "running") {
-    text += " " + theme.fg("accent", status.suffix ?? "");
+    tail = theme.fg("accent", `${status.frame ?? SPINNER_FRAMES[0]} ${status.suffix ?? ""}`);
   } else if (status?.mark === "ok") {
-    text += " " + theme.fg("success", "✓");
-    if (status.suffix) text += " " + theme.fg("dim", status.suffix);
-    if (hint) text += " " + theme.fg("dim", hint);
+    tail = theme.fg("success", "✓");
+    if (status.suffix) tail += " " + theme.fg("dim", status.suffix);
   } else if (status?.mark === "error") {
-    text += " " + theme.fg("error", "✗");
-    if (status.suffix) text += " " + theme.fg("dim", status.suffix);
-    if (hint) text += " " + theme.fg("dim", hint);
+    tail = theme.fg("error", "✗");
+    if (status.suffix) tail += " " + theme.fg("dim", status.suffix);
   }
-  return text;
+  const brief = renderSummary(summary, width, theme, "accent");
+  const separator = theme.fg("dim", " · ");
+  // Optional help is the first thing dropped when space is tight.
+  const help = hint && visibleWidth(head + separator + brief + " " + tail + " " + hint) <= width
+    ? " " + theme.fg("dim", hint)
+    : "";
+  const suffix = (tail ? " " + tail : "") + help;
+  const budget = width - visibleWidth(head + separator + suffix);
+  if (budget >= 1) {
+    return head + separator + renderSummary(summary, budget, theme, "accent") + suffix;
+  }
+  // On very narrow terminals drop the summary, then shorten the label.
+  const headBudget = width - visibleWidth(suffix);
+  if (headBudget >= 1) return truncateToWidth(head, headBudget) + suffix;
+  return truncateToWidth(tail || head, width);
 }
 
 function renderLine(
   theme: Theme,
   toolName: string,
-  summary: string,
-  status?: { mark: "running" | "ok" | "error"; suffix?: string },
-  hint?: string,
+  summary: ToolSummary,
+  status?: LineStatus,
+  hint?: () => string | undefined,
 ): Component {
-  return new Text(formatLine(theme, toolName, summary, status, hint), 0, 0);
+  return {
+    invalidate() {},
+    render(width) {
+      const format = appearance === "minimal" ? formatMinimalLine : formatEmojiLine;
+      return width > 0 ? [format(width, theme, toolName, summary, status, hint?.())] : [];
+    },
+  };
 }
 
 /** Ctrl+O 展开提示：优先用主题化的 keyHint，异常时回退纯文本 */
@@ -595,7 +769,7 @@ function renderQuietCall(
     const { hint, durationMs } = state.status;
     const dur = durationMs !== undefined ? formatSeconds(durationMs) : undefined;
     const suffix = hint && dur ? `${hint} · ${dur}` : (hint ?? dur);
-    const hintText = expandHint && !context.expanded ? expandHintText() : undefined;
+    const hintText = () => expandHint && !context.expanded && latestCompletedState === state ? expandHintText() : undefined;
     return renderLine(theme, toolName, summary, {
       mark: context.isError ? "error" : "ok",
       suffix,
@@ -605,20 +779,20 @@ function renderQuietCall(
   // 执行中：启动动画（只启动一次）
   if (context.isPartial) {
     if (context.executionStarted) {
-      state.startedAt ??= Date.now();
       if (!state.animInterval) {
         const iv = setInterval(() => context.invalidate(), SPINNER_INTERVAL_MS);
         state.animInterval = iv;
         activeTimers.add(iv);
       }
-      const elapsed = formatSeconds(Date.now() - state.startedAt);
+      const elapsed = formatSeconds(Date.now() - (state.startedAt ?? Date.now()));
       const frame =
         SPINNER_FRAMES[
           Math.floor(Date.now() / SPINNER_INTERVAL_MS) % SPINNER_FRAMES.length
         ];
       return renderLine(theme, toolName, summary, {
         mark: "running",
-        suffix: `${frame} ${elapsed}`,
+        frame,
+        suffix: elapsed,
       });
     }
     // 参数就绪但尚未开始执行：静态行
@@ -633,15 +807,13 @@ function renderQuietCall(
   return renderLine(theme, toolName, summary);
 }
 
-/** quiet 模式的 result 渲染：结果不显示任何内容，只把统计抽到 state 里 */
-function renderQuietResult(
+/** 所有显示模式都记录完成状态，避免展开详情时漏记结束时间。 */
+function recordResultStatus(
   toolName: string,
   result: any,
   options: RenderResultOptions,
-  theme: Theme,
   context: RenderContext,
-): Component {
-  void theme;
+): void {
   const state = context.state as RowState;
 
   if (!options.isPartial) {
@@ -650,12 +822,12 @@ function renderQuietResult(
       const finishedAt = Date.now();
       state.status = {
         hint: computeStatusHint(toolName, result, context.isError),
-        durationMs: state.startedAt ? finishedAt - state.startedAt : undefined,
+        durationMs: state.startedAt !== undefined ? finishedAt - state.startedAt : undefined,
       };
+      latestCompletedState = state;
     }
     // 完成后的过渡帧由 renderCall 的 finalTick 驱动重绘
   }
-  return new Text("", 0, 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -676,6 +848,10 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
     },
 
     renderCall(args, theme, context) {
+      const state = context.state as RowState;
+      if (context.executionStarted && context.isPartial && !state.status) {
+        state.startedAt ??= Date.now();
+      }
       const builtin = getDefinitions(context.cwd)[name];
       if (!hidden || context.expanded) {
         // 展开/完整模式：动画与占位交给内置渲染器
@@ -686,11 +862,12 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
     },
 
     renderResult(result, options, theme, context) {
+      recordResultStatus(name, result, options, context);
       const builtin = getDefinitions(context.cwd)[name];
       if (!hidden || context.expanded) {
         return delegateResult(builtin, result, options, theme, context);
       }
-      return renderQuietResult(name, result as never, options, theme, context);
+      return new Text("", 0, 0);
     },
   });
 }
@@ -701,6 +878,7 @@ function registerQuietTool(pi: ExtensionAPI, name: BuiltinName) {
 
 export default function (pi: ExtensionAPI) {
   loadConfig();
+  latestCompletedState = undefined;
 
   // 可选 CLI flag：启动即完整显示（优先级高于配置文件）
   pi.registerFlag("show-tools", {
@@ -741,6 +919,7 @@ export default function (pi: ExtensionAPI) {
 
   // 清理 per-row 渲染缓存、工具定义缓存与运行中的动画/计时定时器
   pi.on("session_shutdown", () => {
+    latestCompletedState = undefined;
     for (const iv of activeTimers) clearInterval(iv);
     activeTimers.clear();
     for (const t of activeTimeouts) clearTimeout(t);

@@ -7,13 +7,14 @@
 import { createJiti } from "jiti";
 import { fileURLToPath } from "node:url";
 import { dirname, join } from "node:path";
-import { existsSync, readFileSync, rmSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { isolateHome } from "./helpers.mjs";
 
 const here = dirname(fileURLToPath(import.meta.url));
 const repoRoot = join(here, "..");
 
 // isolate config file reads from the real user config
-process.env.HOME = "/tmp/qt-tests-home";
+const testHome = isolateHome();
 
 const jiti = createJiti(import.meta.url, { interopDefault: true });
 
@@ -82,8 +83,8 @@ console.log("bash:");
   ctx = makeCtx(st, true, true);
   ctx.args = { command: "npm run build" };
   out = lineText(bash.renderCall(ctx.args, theme, ctx));
-  ok("running shows label + summary", out.includes("💻 Bash") && out.includes("npm run build"), JSON.stringify(out));
-  ok("running has spinner frame", /[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s\d+(\.\d+)?s/.test(out), JSON.stringify(out));
+  ok("running shows label + summary without emoji", out.includes("Bash") && out.includes("npm run build") && !out.includes("💻"), JSON.stringify(out));
+  ok("running has leading spinner and elapsed time", /^[⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏]\s+Bash.*\d+(\.\d+)?s/.test(out), JSON.stringify(out));
   ok("running started interval", st.animInterval !== undefined);
 
   // completion: isPartial flips to false, then result arrives
@@ -96,7 +97,7 @@ console.log("bash:");
   await new Promise((r) => setTimeout(r, 60));
   out = lineText(bash.renderCall(ctx.args, theme, ctx));
   ok("final line shows ✓", out.includes("✓"), JSON.stringify(out));
-  ok("final line shows duration", /✓\s\d+(\.\d+)?[sm]/.test(out), JSON.stringify(out));
+  ok("final line shows duration", /^✓\s+Bash\s+\d+(\.\d+)?[sm]/.test(out), JSON.stringify(out));
   ok("final line shows expand hint", out.toLowerCase().includes("expand"), JSON.stringify(out));
   ok("timers cleared", st.animInterval === undefined && st.finalTick === undefined);
 }
@@ -113,7 +114,7 @@ console.log("bash error:");
   bash.renderResult(result, { expanded: false, isPartial: false }, theme, ctx);
   await new Promise((r) => setTimeout(r, 60));
   const out = lineText(bash.renderCall(ctx.args, theme, ctx));
-  ok("error line ✗ exit 2", out.includes("✗") && out.includes("exit 2"), JSON.stringify(out));
+  ok("error line starts with × and shows exit 2", out.startsWith("×") && out.includes("exit 2"), JSON.stringify(out));
 }
 
 console.log("other tools:");
@@ -121,7 +122,7 @@ console.log("other tools:");
   let st = {}, ctx = makeCtx(st, false, true);
   ctx.args = { path: "/Users/akisy/Projects/x/Sources/App.swift" };
   let out = lineText(read.renderCall(ctx.args, theme, ctx));
-  ok("read relative path", out.includes("Sources/App.swift") && out.includes("📖 Read"), JSON.stringify(out));
+  ok("read relative path", out.includes("Sources/App.swift") && /^·\s+Read\s/.test(out), JSON.stringify(out));
 
   st = {}; ctx = makeCtx(st, false, true);
   ctx.args = { path: "/Users/akisy/Projects/x/Sources/App.swift", offset: 120 };
@@ -160,11 +161,11 @@ console.log("result stats:");
     const st = {};
     const ctx = makeCtx(st, false, true, isError);
     ctx.args =
-      tool === "read"
+      tool.name === "read"
         ? { path: "a.md" }
-        : tool === "grep"
+        : tool.name === "grep"
           ? { pattern: "x" }
-          : tool === "edit"
+          : tool.name === "edit"
             ? { path: "a.ts", edits: [{}] }
             : {};
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, ctx);
@@ -182,6 +183,30 @@ console.log("result stats:");
 
   out = await statFor(read, { content: [{ type: "text", text: "line1\nline2\nline3" }], details: {} });
   ok("read 3 lines", out.includes("3 lines"), JSON.stringify(out));
+
+  for (const [text, expected] of [["a\n\nb", 3], ["a\n\nb\n", 3], ["a\n\n", 2], ["\n", 1], ["a\r\n \r\nb\r\n", 3]]) {
+    out = await statFor(read, { content: [{ type: "text", text }], details: {} });
+    ok(`read counts blank lines in ${JSON.stringify(text)}`, out.includes(`${expected} lines`), JSON.stringify(out));
+  }
+
+  out = await statFor(read, { content: [{ type: "text", text: "" }], details: {} });
+  ok("empty read does not invent a line", !out.includes("1 lines"), JSON.stringify(out));
+
+  out = await statFor(grep, { content: [{ type: "text", text: "a.ts-1- context.ts:99: text\na.ts:2: match\na.ts-3- after\n\n[1 matches limit reached. Use limit=2 for more]" }], details: {} });
+  ok("grep excludes context even when it contains a location", out.includes("1 matches"), JSON.stringify(out));
+
+  out = await statFor(grep, { content: [{ type: "text", text: "C:\\src\\file-2026-backup.ts-1- before\nC:\\src\\file-2026-backup.ts:2: match\nC:\\src\\file-2026-backup.ts-3- after" }], details: {} });
+  ok("grep handles Windows paths and numeric filename segments", out.includes("1 matches"), JSON.stringify(out));
+
+  const fixtureDir = join(testHome, "fixtures");
+  mkdirSync(fixtureDir);
+  writeFileSync(join(fixtureDir, "sample.txt"), "before\nneedle\n\nneedle\nafter\n");
+  const actualRead = await read.execute("real-read", { path: "sample.txt" }, undefined, undefined, { cwd: fixtureDir });
+  out = await statFor(read, actualRead);
+  ok("real read counts blank lines and trailing newline", out.includes("5 lines"), JSON.stringify(out));
+  const actualGrep = await grep.execute("real-grep", { pattern: "needle", path: ".", context: 1 }, undefined, undefined, { cwd: fixtureDir });
+  out = await statFor(grep, actualGrep);
+  ok("real grep counts matches with overlapping context", out.includes("2 matches"), JSON.stringify(out));
 
   out = await statFor(read, { content: [{ type: "text", text: "x\n\n[Showing lines 1-5 of 200. Use offset=6 to continue.]" }], details: {} });
   ok("read truncated range", out.includes("lines 1-5/200"), JSON.stringify(out));
@@ -201,7 +226,7 @@ console.log("error hints:");
   async function errorFor(tool, result) {
     const st = {};
     const ctx = makeCtx(st, false, true, true);
-    ctx.args = tool === "read" ? { path: "a.md" } : { command: "x" };
+    ctx.args = tool.name === "read" ? { path: "a.md" } : { command: "x" };
     tool.renderResult(result, { expanded: false, isPartial: false }, theme, ctx);
     await new Promise((r) => setTimeout(r, 60));
     return lineText(tool.renderCall(ctx.args, theme, ctx));
@@ -221,7 +246,7 @@ console.log("error hints:");
 
 console.log("config persistence:");
 {
-  const cfgPath = join(process.env.HOME, ".pi", "quiet-tools.json");
+  const cfgPath = join(testHome, ".pi", "quiet-tools.json");
   rmSync(cfgPath, { force: true });
   const cmdCtx = {
     mode: "tui",
@@ -234,11 +259,33 @@ console.log("config persistence:");
   await commands.toggletools.handler("full", cmdCtx);
   const saved1 = JSON.parse(readFileSync(cfgPath, "utf8"));
   ok("toggletools full persists config", saved1.hidden === false, JSON.stringify(saved1));
-  ok("config persists expandHint and no default styles", saved1.expandHint === true && saved1.style === undefined, JSON.stringify(saved1));
+  ok("config omits all default settings", JSON.stringify(saved1) === '{"hidden":false}', JSON.stringify(saved1));
   await commands.toggletools.handler("", cmdCtx);
-  ok("toggletools toggle-back persists config", JSON.parse(readFileSync(cfgPath, "utf8")).hidden === true);
+  ok("toggletools quiet persists empty defaults", readFileSync(cfgPath, "utf8") === "{}");
+
+  writeFileSync(cfgPath, JSON.stringify({ appearance: "emoji", icons: false, maxSummary: 24, expandHint: false, style: { read: { icon: "R", label: "Read" }, bash: { icon: "💻", label: "Shell" } } }));
+  mod.default(piMock);
+  await commands.toggletools.handler("full", cmdCtx);
+  const savedCustom = JSON.parse(readFileSync(cfgPath, "utf8"));
+  ok("config preserves custom settings and emoji appearance", savedCustom.appearance === "emoji" && savedCustom.icons === false && savedCustom.maxSummary === 24 && savedCustom.expandHint === false, JSON.stringify(savedCustom));
+  ok("config omits default fields inside custom styles", JSON.stringify(savedCustom.style) === '{"read":{"icon":"R"},"bash":{"label":"Shell"}}', JSON.stringify(savedCustom));
+
+  await commands.toggletools.handler("quiet", cmdCtx);
+  const customCtx = makeCtx({}, true, false);
+  customCtx.args = { path: "x".repeat(80) };
+  const customLine = lineText(read.renderCall(customCtx.args, theme, customCtx));
+  ok("maxSummary applies to paths and icons can be disabled", customLine.trim() === "Read · " + "x".repeat(12) + "…" + "x".repeat(11), JSON.stringify(customLine));
+
+  writeFileSync(cfgPath, JSON.stringify({ appearance: "emoji" }));
+  mod.default(piMock);
+  const emojiLine = lineText(read.renderCall(customCtx.args, theme, customCtx));
+  ok("emoji appearance restores original icons", emojiLine.startsWith("📖 Read · "), JSON.stringify(emojiLine));
+
+  rmSync(cfgPath);
+  mod.default(piMock);
+  const restoredLine = lineText(read.renderCall(customCtx.args, theme, customCtx));
+  ok("deleting config restores minimal defaults on reload", restoredLine.trim() === "·  Read        " + "x".repeat(30) + "…" + "x".repeat(29), JSON.stringify(restoredLine));
 }
 
 console.log(failures === 0 ? "\nALL PASSED" : `\n${failures} FAILED`);
 process.exit(failures === 0 ? 0 : 1);
-
