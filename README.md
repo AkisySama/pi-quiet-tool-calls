@@ -46,7 +46,7 @@ The default **minimal** appearance uses a leading status symbol, aligned tool la
 From GitHub (recommended, pinned to a release tag):
 
 ```bash
-pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.1.0
+pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.2.0
 ```
 
 Try it without installing:
@@ -154,7 +154,7 @@ MIT
 安装：
 
 ```bash
-pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.1.0
+pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.2.0
 ```
 
 安装即生效，无需其他配置。

@@ -44,7 +44,7 @@
 从 GitHub 安装（推荐，固定到发布 tag）：
 
 ```bash
-pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.1.0
+pi install git:github.com/AkisySama/pi-quiet-tool-calls@v2.2.0
 ```
 
 不安装直接试用：
